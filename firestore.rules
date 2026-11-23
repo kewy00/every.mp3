@@ -1,0 +1,170 @@
+rules_version = '2';
+
+// ===============================================================
+// Assumed Data Model
+// ===============================================================
+//
+// This security rules file assumes the following data structures for every.mp3
+// (all data is per-user, authenticated via Firebase Auth Google Sign-In):
+//
+// Collection: users
+// Document ID: {uid} (matches request.auth.uid)
+// Fields:
+//   - theme: string (required, enum: 'dark' | 'light') - UI theme preference
+//   - sfxEnabled: bool (required) - Whether UI sound effects are enabled
+//   - defaultFormat: string (required, 1..32 chars) - Default download format (e.g., 'audio:320k')
+//   - updatedAt: timestamp (required, recent server timestamp) - Last preference update time
+//
+// Subcollection: users/{uid}/history
+// Document ID: {itemId} (auto-generated Firestore ID)
+// Note: Parent users/{uid} document is NOT required to exist, because new
+//       authenticated users may download media before modifying preferences.
+// Fields (immutable after creation; updates are denied):
+//   - title: string (required, 0..200 chars) - Media title
+//   - author: string (required, 0..160 chars) - Media author/channel/artist
+//   - platform: string (required, 0..60 chars) - Source platform label
+//   - url: string (required, 0..500 chars, empty or http(s):// URL) - Source media URL
+//   - type: string (required, enum: 'audio' | 'video') - Downloaded media type
+//   - format: string (required, 0..40 chars) - Output format label (e.g., 'MP3 · 320k')
+//   - size: string (required, 0..40 chars) - Formatted file size label
+//   - thumbnail: string (required, 0..600 chars, empty or http(s):// URL) - Thumbnail URL
+//   - createdAt: timestamp (required, recent server timestamp, immutable) - Download time
+//
+// ===============================================================
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ===============================================================
+    // Helper Functions
+    // ===============================================================
+
+    // Check if the user is authenticated
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    // Check if the authenticated user owns the path-scoped resource
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    // Verify uid field (if ever present) matches authenticated user on create
+    function uidUnchanged() {
+      return !('uid' in request.resource.data) ||
+        request.resource.data.uid == request.auth.uid;
+    }
+
+    // Ensure uid field (if ever present) is not modified on update
+    function uidNotModified() {
+      return !('uid' in request.resource.data) ||
+        request.resource.data.uid == resource.data.uid;
+    }
+
+    // Validate that all required fields exist
+    function hasRequiredFields(fields) {
+      return request.resource.data.keys().hasAll(fields);
+    }
+
+    // Validate that the document contains only allowed fields (strict schema)
+    function hasOnlyAllowedFields(fields) {
+      return request.resource.data.keys().hasOnly(fields);
+    }
+
+    // Validate URL format (must start with https:// or http://)
+    function isValidUrl(url) {
+      return url is string &&
+        (url.matches('^https://.*') || url.matches('^http://.*'));
+    }
+
+    // Validate that a timestamp is recent (within 5 minutes of server request.time)
+    function isRecent(time) {
+      return time is timestamp &&
+        time > request.time - duration.value(5, 'm') &&
+        time <= request.time;
+    }
+
+    // ===============================================================
+    // Domain Validators (Used on both create and update)
+    // ===============================================================
+
+    function isValidUserPreferences(data) {
+      let allowedFields = ['theme', 'sfxEnabled', 'defaultFormat', 'updatedAt'];
+      return hasOnlyAllowedFields(allowedFields) &&
+        hasRequiredFields(allowedFields) &&
+        data.theme is string &&
+        data.theme in ['dark', 'light'] &&
+        data.sfxEnabled is bool &&
+        data.defaultFormat is string &&
+        data.defaultFormat.size() >= 1 &&
+        data.defaultFormat.size() <= 32 &&
+        isRecent(data.updatedAt);
+    }
+
+    function isValidHistoryItem(data) {
+      let allowedFields = [
+        'title',
+        'author',
+        'platform',
+        'url',
+        'type',
+        'format',
+        'size',
+        'thumbnail',
+        'createdAt'
+      ];
+      return hasOnlyAllowedFields(allowedFields) &&
+        hasRequiredFields(allowedFields) &&
+        data.title is string &&
+        data.title.size() <= 200 &&
+        data.author is string &&
+        data.author.size() <= 160 &&
+        data.platform is string &&
+        data.platform.size() <= 60 &&
+        data.url is string &&
+        data.url.size() <= 500 &&
+        (data.url == '' || isValidUrl(data.url)) &&
+        data.type is string &&
+        data.type in ['audio', 'video'] &&
+        data.format is string &&
+        data.format.size() <= 40 &&
+        data.size is string &&
+        data.size.size() <= 40 &&
+        data.thumbnail is string &&
+        data.thumbnail.size() <= 600 &&
+        (data.thumbnail == '' || isValidUrl(data.thumbnail)) &&
+        isRecent(data.createdAt);
+    }
+
+    // ===============================================================
+    // Collection Rules
+    // ===============================================================
+
+    // User preferences document: strictly owner-only
+    match /users/{uid} {
+      allow read: if isOwner(uid);
+      allow create: if isOwner(uid) &&
+        uidUnchanged() &&
+        isValidUserPreferences(request.resource.data);
+      allow update: if isOwner(uid) &&
+        uidNotModified() &&
+        isValidUserPreferences(request.resource.data);
+      allow delete: if isOwner(uid);
+
+      // Download history subcollection: strictly owner-only, append & delete only
+      match /history/{itemId} {
+        allow read: if isOwner(uid);
+        allow create: if isOwner(uid) &&
+          uidUnchanged() &&
+          isValidHistoryItem(request.resource.data);
+        allow update: if false;
+        allow delete: if isOwner(uid);
+      }
+    }
+
+    // Default deny everything else
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
