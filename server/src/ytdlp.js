@@ -18,6 +18,7 @@ export const jobs = new Map();
 
 const engineStatus = {
   ytdlpVersion: null,
+  impersonateAvailable: false,
 };
 
 let cachedEnvCookiesSource = null;
@@ -67,8 +68,18 @@ function getYouTubeFallbackClient() {
   return hasCookiesConfigured() ? 'tv,web_safari,mweb,web' : 'android,mweb,tv_simply,web_embedded';
 }
 
+function getYouTubeFallbackOptions(stderr) {
+  const lower = String(stderr || '').toLowerCase();
+  const hitWebpageOr429 = lower.includes('429') || lower.includes('unable to download webpage');
+  return {
+    playerClientOverride: (process.env.YTDLP_PLAYER_CLIENT || '').trim() || getYouTubeFallbackClient(),
+    skipWebpage: hitWebpageOr429,
+    impersonateOverride: engineStatus.impersonateAvailable ? 'chrome' : '',
+  };
+}
+
 function shouldRetryYouTube(stderr, platformKey) {
-  if (platformKey !== 'youtube' || (process.env.YTDLP_PLAYER_CLIENT || '').trim()) {
+  if (platformKey !== 'youtube') {
     return false;
   }
   const lower = String(stderr || '').toLowerCase();
@@ -84,6 +95,8 @@ function shouldRetryYouTube(stderr, platformKey) {
   }
   const retryable = [
     'failed to extract any player response',
+    'unable to download webpage',
+    'http error 429',
     'sign in to confirm',
     'http error 403',
     'requested format is not available',
@@ -94,7 +107,10 @@ function shouldRetryYouTube(stderr, platformKey) {
   return retryable.some((r) => lower.includes(r));
 }
 
-function getCommonYtDlpArgs(platformKey = 'generic', { playerClientOverride = '' } = {}) {
+function getCommonYtDlpArgs(
+  platformKey = 'generic',
+  { playerClientOverride = '', skipWebpage = false, impersonateOverride = '' } = {}
+) {
   const args = [
     '--js-runtimes',
     'node',
@@ -108,6 +124,11 @@ function getCommonYtDlpArgs(platformKey = 'generic', { playerClientOverride = ''
 
   if (process.env.YTDLP_FORCE_IPV4 !== 'false') {
     args.push('--force-ipv4');
+  }
+
+  const impersonate = (impersonateOverride || process.env.YTDLP_IMPERSONATE || '').trim();
+  if (impersonate) {
+    args.push('--impersonate', impersonate);
   }
 
   const proxy = (process.env.YTDLP_PROXY || '').trim();
@@ -131,6 +152,7 @@ function getCommonYtDlpArgs(platformKey = 'generic', { playerClientOverride = ''
     const visitorData = (process.env.YTDLP_VISITOR_DATA || '').trim();
 
     if (playerClient) ytArgs.push(`player_client=${playerClient}`);
+    if (skipWebpage) ytArgs.push('player_skip=webpage,configs');
     if (poToken) ytArgs.push(`po_token=${poToken}`);
     if (visitorData) ytArgs.push(`visitor_data=${visitorData}`);
 
@@ -164,6 +186,7 @@ function formatYtDlpError(stderr, platformKey) {
   const cleanErr = safeStderr.split('\n').find((l) => l.includes('ERROR:')) || safeStderr.trim();
   const msg = cleanErr.replace(/^ERROR:\s*/, '');
   const lower = msg.toLowerCase();
+  const fullLower = safeStderr.toLowerCase();
 
   if (
     platformKey === 'instagram' &&
@@ -173,6 +196,9 @@ function formatYtDlpError(stderr, platformKey) {
   }
 
   if (platformKey === 'youtube') {
+    if (fullLower.includes('http error 429') || fullLower.includes('too many requests')) {
+      return 'YouTube está bloqueando/limitando la IP compartida de este servidor en la nube (HTTP 429: Too Many Requests). Para solucionarlo en Render/Railway, configura YTDLP_COOKIES_B64 (cookies exportadas de YouTube) o YTDLP_PROXY (proxy HTTP/SOCKS5) en las variables de entorno del servidor.';
+    }
     if (lower.includes('sign in to confirm') || lower.includes('not a bot')) {
       return 'YouTube bloqueó la IP de este servidor en la nube (verificación anti-bot). Configura YTDLP_COOKIES_B64 (cookies exportadas de YouTube) o YTDLP_PROXY en las variables de entorno de tu servidor.';
     }
@@ -212,6 +238,15 @@ function execYtDlpSimple(args, timeoutMs = 60000) {
   });
 }
 
+async function detectImpersonateSupport() {
+  const imp = await execYtDlpSimple(['--list-impersonate-targets'], 15000);
+  if (imp.code === 0 && imp.stdout) {
+    const lines = imp.stdout.split(/\r?\n/);
+    engineStatus.impersonateAvailable = lines.some((l) => /chrome/i.test(l) && !/unavailable/i.test(l));
+    console.log(`[yt-dlp] impersonate chrome disponible: ${engineStatus.impersonateAvailable}`);
+  }
+}
+
 export async function initYtDlp() {
   const ver = await execYtDlpSimple(['--version'], 15000);
   if (ver.code === 0 && ver.stdout) {
@@ -221,6 +256,8 @@ export async function initYtDlp() {
     console.warn(`[yt-dlp] no se pudo detectar la versión: ${ver.stderr || 'error desconocido'}`);
   }
 
+  await detectImpersonateSupport();
+
   if (process.env.YTDLP_AUTO_UPDATE !== 'false') {
     const upd = await execYtDlpSimple(['-U'], 45000);
     if (upd.code === 0) {
@@ -228,6 +265,7 @@ export async function initYtDlp() {
       if (refreshed.code === 0 && refreshed.stdout) {
         engineStatus.ytdlpVersion = refreshed.stdout;
       }
+      await detectImpersonateSupport();
       console.log(`[yt-dlp] comprobación de actualización completada (${engineStatus.ytdlpVersion || 'desconocida'})`);
     } else if (upd.stderr || upd.stdout) {
       console.warn(`[yt-dlp] auto-actualización omitida: ${redactSecrets(upd.stderr || upd.stdout).split('\n')[0]}`);
@@ -238,6 +276,7 @@ export async function initYtDlp() {
 export function getEngineDiagnostics() {
   return {
     ytdlpVersion: engineStatus.ytdlpVersion,
+    impersonateAvailable: engineStatus.impersonateAvailable,
     cookiesConfigured: hasCookiesConfigured(),
     proxyConfigured: Boolean((process.env.YTDLP_PROXY || '').trim()),
     playerClient: (process.env.YTDLP_PLAYER_CLIENT || '').trim() || 'default',
@@ -274,14 +313,14 @@ function sanitizeFilename(name) {
     .slice(0, 120);
 }
 
-function runYtDlpJsonOnce(url, platformKey, { playerClientOverride = '' } = {}) {
+function runYtDlpJsonOnce(url, platformKey, ytOpts = {}) {
   return new Promise((resolve, reject) => {
     const args = [
       '--dump-single-json',
       '--playlist-end',
       '50',
       '--skip-download',
-      ...getCommonYtDlpArgs(platformKey, { playerClientOverride }),
+      ...getCommonYtDlpArgs(platformKey, ytOpts),
     ];
 
     // SoundCloud flat-playlist omits titles, durations, and thumbnails;
@@ -326,10 +365,12 @@ async function runYtDlpJson(url, platformKey) {
       throw new Error(`No se pudo ejecutar yt-dlp: ${firstErr.stderr}`);
     }
     if (!firstErr?.parseError && shouldRetryYouTube(firstErr?.stderr, platformKey)) {
-      const fallbackClient = getYouTubeFallbackClient();
-      console.warn(`[yt-dlp] inspect falló con cliente por defecto, reintentando con ${fallbackClient}...`);
+      const fallbackOpts = getYouTubeFallbackOptions(firstErr?.stderr);
+      console.warn(
+        `[yt-dlp] inspect falló, reintentando con client=${fallbackOpts.playerClientOverride}, skipWebpage=${fallbackOpts.skipWebpage}, impersonate=${fallbackOpts.impersonateOverride || 'none'}...`
+      );
       try {
-        return await runYtDlpJsonOnce(url, platformKey, { playerClientOverride: fallbackClient });
+        return await runYtDlpJsonOnce(url, platformKey, fallbackOpts);
       } catch (secondErr) {
         console.error(`[yt-dlp] inspect error (${platformKey}):\n${redactSecrets(secondErr?.stderr || firstErr?.stderr)}`);
         throw new Error(formatYtDlpError(secondErr?.stderr || firstErr?.stderr, platformKey));
@@ -456,11 +497,11 @@ export async function createDownloadJob({ url, searchQuery, mode = 'audio', qual
   const safeBase = title ? sanitizeFilename(title) : '%(title).100s';
   const outputTemplate = path.join(jobDir, `${safeBase}.%(ext)s`);
 
-  const buildArgs = (playerClientOverride = '') => {
+  const buildArgs = (ytOpts = {}) => {
     const args = [
       '--newline',
       '--no-playlist',
-      ...getCommonYtDlpArgs(platformKey, { playerClientOverride }),
+      ...getCommonYtDlpArgs(platformKey, ytOpts),
       '-o',
       outputTemplate,
     ];
@@ -511,8 +552,8 @@ export async function createDownloadJob({ url, searchQuery, mode = 'audio', qual
     }
   };
 
-  const startAttempt = (playerClientOverride = '', isRetry = false) => {
-    const proc = spawn('yt-dlp', buildArgs(playerClientOverride), { windowsHide: true });
+  const startAttempt = (ytOpts = {}, isRetry = false) => {
+    const proc = spawn('yt-dlp', buildArgs(ytOpts), { windowsHide: true });
     let stderrBuf = '';
 
     proc.stdout.on('data', (chunk) => {
@@ -538,8 +579,10 @@ export async function createDownloadJob({ url, searchQuery, mode = 'audio', qual
     proc.on('close', async (code) => {
       if (code !== 0) {
         if (!isRetry && shouldRetryYouTube(stderrBuf, platformKey)) {
-          const fallbackClient = getYouTubeFallbackClient();
-          console.warn(`[yt-dlp] download falló con cliente por defecto, reintentando con ${fallbackClient}...`);
+          const fallbackOpts = getYouTubeFallbackOptions(stderrBuf);
+          console.warn(
+            `[yt-dlp] download falló, reintentando con client=${fallbackOpts.playerClientOverride}, skipWebpage=${fallbackOpts.skipWebpage}, impersonate=${fallbackOpts.impersonateOverride || 'none'}...`
+          );
           try {
             const leftover = await fs.readdir(jobDir);
             await Promise.all(leftover.map((f) => fs.rm(path.join(jobDir, f), { force: true })));
@@ -550,7 +593,7 @@ export async function createDownloadJob({ url, searchQuery, mode = 'audio', qual
           job.speed = '';
           job.phase = 'Reintentando con cliente alternativo de YouTube...';
           emitUpdate();
-          startAttempt(fallbackClient, true);
+          startAttempt(fallbackOpts, true);
           return;
         }
 
