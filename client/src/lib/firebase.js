@@ -64,14 +64,14 @@ export async function logoutGoogle() {
 
 export async function loadUserPreferences(uid) {
   if (!db || !uid) return null;
-  const snap = await getDoc(doc(db, 'users', uid));
+  const snap = await getDoc(doc(db, 'every_mp3_users', uid));
   return snap.exists() ? snap.data() : null;
 }
 
 export async function saveUserPreferences(uid, prefs) {
   if (!db || !uid) return;
   await setDoc(
-    doc(db, 'users', uid),
+    doc(db, 'every_mp3_users', uid),
     {
       ...prefs,
       updatedAt: serverTimestamp(),
@@ -82,7 +82,7 @@ export async function saveUserPreferences(uid, prefs) {
 
 export function subscribeUserHistory(uid, callback) {
   if (!db || !uid) return () => {};
-  const q = query(collection(db, 'users', uid, 'history'), orderBy('createdAt', 'desc'), limit(50));
+  const q = query(collection(db, 'every_mp3_users', uid, 'history'), orderBy('createdAt', 'desc'), limit(50));
   return onSnapshot(q, (snap) => {
     const items = snap.docs.map((d) => ({
       id: d.id,
@@ -94,7 +94,7 @@ export function subscribeUserHistory(uid, callback) {
 
 export async function addUserHistoryItem(uid, item) {
   if (!db || !uid) return null;
-  const ref = await addDoc(collection(db, 'users', uid, 'history'), {
+  const ref = await addDoc(collection(db, 'every_mp3_users', uid, 'history'), {
     title: String(item.title || '').slice(0, 200),
     author: String(item.author || '').slice(0, 160),
     platform: String(item.platform || '').slice(0, 60),
@@ -110,11 +110,11 @@ export async function addUserHistoryItem(uid, item) {
 
 export async function deleteUserHistoryItem(uid, itemId) {
   if (!db || !uid || !itemId) return;
-  await deleteDoc(doc(db, 'users', uid, 'history', itemId));
+  await deleteDoc(doc(db, 'every_mp3_users', uid, 'history', itemId));
 }
 
 export async function clearUserHistory(uid) {
   if (!db || !uid) return;
-  const snap = await getDocs(collection(db, 'users', uid, 'history'));
+  const snap = await getDocs(collection(db, 'every_mp3_users', uid, 'history'));
   await Promise.all(snap.docs.map((d) => deleteDoc(d.ref)));
 }
