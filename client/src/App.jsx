@@ -16,7 +16,8 @@ import HistoryStack from './components/HistoryStack';
 import ProfileModal from './components/ProfileModal';
 import { SFX } from './lib/sfx';
 import {
-  checkEngineHealth,
+  checkEnginesStatus,
+  isMobileDevice,
   inspectMediaUrl,
   startDownloadStream,
   triggerBrowserDownload,
@@ -62,6 +63,7 @@ export default function App() {
   );
   const [defaultFormat, setDefaultFormat] = useState(initialPrefs.defaultFormat || 'audio:320k');
 
+  const [isMobile] = useState(() => isMobileDevice());
   const [engineOnline, setEngineOnline] = useState(true);
   const [island, setIsland] = useState({
     status: 'idle',
@@ -123,12 +125,21 @@ export default function App() {
     }
   };
 
-  // Check backend engine health on mount
+  // Check cloud & local engine health on mount
   useEffect(() => {
-    checkEngineHealth().then((ok) => {
-      setEngineOnline(ok);
-      if (!ok) {
+    checkEnginesStatus().then(({ cloudOnline, localOnline, isMobile: mobile }) => {
+      const anyOnline = cloudOnline || localOnline;
+      setEngineOnline(anyOnline);
+      if (!anyOnline) {
         setIsland({ status: 'error', text: 'Motor de descargas desconectado' });
+      } else if (mobile) {
+        setIsland({ status: 'idle', text: 'Listo · TikTok, SoundCloud e Instagram' });
+      } else if (cloudOnline && localOnline) {
+        setIsland({ status: 'idle', text: 'Listo · Servidor + YouTube local activos' });
+      } else if (localOnline) {
+        setIsland({ status: 'idle', text: 'Listo · Motor local (PC) activo' });
+      } else {
+        setIsland({ status: 'idle', text: 'Listo · Servidor activo (YouTube en PC local)' });
       }
     });
   }, []);
@@ -256,6 +267,7 @@ export default function App() {
               mode,
               quality,
               title: track.artist ? `${track.artist} - ${track.title}` : track.title,
+              engineSource: activeMedia.engineSource,
             },
             (evt) => {
               const overall = Math.round(((i + (evt.progress || 0) / 100) / selected.length) * 100);
@@ -307,6 +319,7 @@ export default function App() {
           mode,
           quality,
           title: activeMedia.title,
+          engineSource: activeMedia.engineSource,
         },
         (evt) => {
           setDownloadState({
@@ -539,7 +552,9 @@ export default function App() {
           <section className="text-center mb-8">
             <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full glass-pill text-[11px] font-medium text-muted mb-4 tracking-wide uppercase">
               <span className="w-1.5 h-1.5 rounded-full bg-[#FF3D6E]" />
-              YouTube · Spotify · SoundCloud · TikTok · Instagram
+              {isMobile
+                ? 'TikTok · SoundCloud · Instagram'
+                : 'YouTube (PC local) · Spotify · SoundCloud · TikTok · Instagram'}
             </div>
             <h1 className="text-3xl sm:text-5xl font-semibold tracking-tight leading-[1.1] mb-3">
               Descarga cualquier medio,
@@ -572,7 +587,11 @@ export default function App() {
                 onBlur={() => document.body.classList.remove('is-focused')}
                 autoComplete="off"
                 spellCheck="false"
-                placeholder="Pega un enlace de YouTube, Spotify, TikTok, Instagram o SoundCloud..."
+                placeholder={
+                  isMobile
+                    ? 'Pega un enlace de TikTok, Instagram o SoundCloud...'
+                    : 'Pega un enlace de YouTube, Spotify, TikTok, Instagram o SoundCloud...'
+                }
                 className="flex-1 bg-transparent outline-none text-sm sm:text-base placeholder:text-[rgba(145,145,155,0.65)] min-w-0 py-2.5"
               />
 

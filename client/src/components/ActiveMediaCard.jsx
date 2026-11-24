@@ -44,7 +44,10 @@ export default function ActiveMediaCard({
     ? (media.tracks || []).filter((t) => t.checked).length
     : 1;
 
-  const thumbSrc = media.thumbnail && !imgError ? thumbnailProxyUrl(media.thumbnail) : '';
+  const thumbSrc =
+    media.thumbnail && !imgError
+      ? thumbnailProxyUrl(media.thumbnail, media.engineSource || 'cloud')
+      : '';
 
   return (
     <div
@@ -95,6 +98,11 @@ export default function ActiveMediaCard({
                   <span className="w-1.5 h-1.5 rounded-full bg-[#FF3D6E]" />
                   {media.platform}
                 </span>
+                {media.engineSource && (
+                  <span className="px-2 py-0.5 rounded-full glass-pill text-[10px] font-medium text-muted">
+                    {media.engineSource === 'local' ? 'PC local' : 'Servidor'}
+                  </span>
+                )}
               </div>
               <h3 className="text-lg sm:text-xl font-semibold tracking-tight leading-snug truncate" title={media.title}>
                 {media.title}

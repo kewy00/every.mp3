@@ -7,6 +7,14 @@ import { inspectUrl, createDownloadJob, jobs, initYtDlp, getEngineDiagnostics } 
 const app = express();
 const PORT = Number(process.env.PORT || 3001);
 
+// Allow HTTPS web apps (e.g. Netlify) to connect to a local PC engine (127.0.0.1 / localhost)
+app.use((req, res, next) => {
+  if (req.headers['access-control-request-private-network']) {
+    res.setHeader('Access-Control-Allow-Private-Network', 'true');
+  }
+  next();
+});
+
 app.use(
   cors({
     origin: process.env.ALLOWED_ORIGINS
