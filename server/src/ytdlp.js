@@ -11,35 +11,237 @@ import { resolveSpotify } from './spotify.js';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_COOKIES_PATH = path.resolve(__dirname, '..', 'cookies.txt');
 const TEMP_ROOT = path.join(os.tmpdir(), 'every-mp3-jobs');
+const ENV_COOKIES_PATH = path.join(TEMP_ROOT, 'env-cookies.txt');
 const JOB_TTL_MS = 15 * 60 * 1000; // 15 min cleanup
 
 export const jobs = new Map();
 
-function getCommonYtDlpArgs() {
-  const args = ['--no-warnings', '--js-runtimes', 'node'];
-  const cookiesFile = process.env.YTDLP_COOKIES_FILE || (fsSync.existsSync(DEFAULT_COOKIES_PATH) ? DEFAULT_COOKIES_PATH : '');
-  const cookiesBrowser = process.env.YTDLP_COOKIES_BROWSER || '';
+const engineStatus = {
+  ytdlpVersion: null,
+};
 
+let cachedEnvCookiesSource = null;
+
+function redactSecrets(text) {
+  return String(text || '').replace(/(https?|socks5h?|socks4a?):\/\/([^/\s:@]+):([^/\s@]+)@/gi, '$1://***:***@');
+}
+
+function resolveCookiesFile() {
+  const b64 = (process.env.YTDLP_COOKIES_B64 || '').trim();
+  const raw = (process.env.YTDLP_COOKIES || '').trim();
+
+  if (b64 || raw) {
+    const sourceKey = b64 ? `b64:${b64}` : `raw:${raw}`;
+    if (cachedEnvCookiesSource !== sourceKey || !fsSync.existsSync(ENV_COOKIES_PATH)) {
+      try {
+        let content = b64 ? Buffer.from(b64, 'base64').toString('utf8') : raw;
+        if (!b64 && !content.includes('\n') && content.includes('\\n')) {
+          content = content.replace(/\\n/g, '\n');
+        }
+        fsSync.mkdirSync(TEMP_ROOT, { recursive: true });
+        fsSync.writeFileSync(ENV_COOKIES_PATH, content, { mode: 0o600 });
+        cachedEnvCookiesSource = sourceKey;
+      } catch (err) {
+        console.error('[yt-dlp] Error escribiendo cookies desde variable de entorno:', err.message);
+        return '';
+      }
+    }
+    return ENV_COOKIES_PATH;
+  }
+
+  const cookiesFile = (process.env.YTDLP_COOKIES_FILE || '').trim();
   if (cookiesFile && fsSync.existsSync(cookiesFile)) {
+    return cookiesFile;
+  }
+  if (fsSync.existsSync(DEFAULT_COOKIES_PATH)) {
+    return DEFAULT_COOKIES_PATH;
+  }
+  return '';
+}
+
+function hasCookiesConfigured() {
+  return Boolean(resolveCookiesFile() || (process.env.YTDLP_COOKIES_BROWSER || '').trim());
+}
+
+function getYouTubeFallbackClient() {
+  return hasCookiesConfigured() ? 'tv,web_safari,mweb,web' : 'android,mweb,tv_simply,web_embedded';
+}
+
+function shouldRetryYouTube(stderr, platformKey) {
+  if (platformKey !== 'youtube' || (process.env.YTDLP_PLAYER_CLIENT || '').trim()) {
+    return false;
+  }
+  const lower = String(stderr || '').toLowerCase();
+  const permanent = [
+    'private video',
+    'this video has been removed',
+    'video unavailable',
+    'copyright claim',
+    'members-only content',
+  ];
+  if (permanent.some((p) => lower.includes(p))) {
+    return false;
+  }
+  const retryable = [
+    'failed to extract any player response',
+    'sign in to confirm',
+    'http error 403',
+    'requested format is not available',
+    'precondition check failed',
+    'unable to extract',
+    'the page needs to be reloaded',
+  ];
+  return retryable.some((r) => lower.includes(r));
+}
+
+function getCommonYtDlpArgs(platformKey = 'generic', { playerClientOverride = '' } = {}) {
+  const args = [
+    '--js-runtimes',
+    'node',
+    '--remote-components',
+    'ejs:github',
+    '--socket-timeout',
+    '30',
+    '--retries',
+    '3',
+  ];
+
+  if (process.env.YTDLP_FORCE_IPV4 !== 'false') {
+    args.push('--force-ipv4');
+  }
+
+  const proxy = (process.env.YTDLP_PROXY || '').trim();
+  if (proxy) {
+    args.push('--proxy', proxy);
+  }
+
+  const cookiesFile = resolveCookiesFile();
+  const cookiesBrowser = (process.env.YTDLP_COOKIES_BROWSER || '').trim();
+
+  if (cookiesFile) {
     args.push('--cookies', cookiesFile);
   } else if (cookiesBrowser) {
     args.push('--cookies-from-browser', cookiesBrowser);
   }
+
+  if (platformKey === 'youtube') {
+    const ytArgs = [];
+    const playerClient = (playerClientOverride || process.env.YTDLP_PLAYER_CLIENT || '').trim();
+    const poToken = (process.env.YTDLP_PO_TOKEN || '').trim();
+    const visitorData = (process.env.YTDLP_VISITOR_DATA || '').trim();
+
+    if (playerClient) ytArgs.push(`player_client=${playerClient}`);
+    if (poToken) ytArgs.push(`po_token=${poToken}`);
+    if (visitorData) ytArgs.push(`visitor_data=${visitorData}`);
+
+    if (ytArgs.length > 0) {
+      args.push('--extractor-args', `youtube:${ytArgs.join(';')}`);
+    }
+  }
+
+  const extraExtractorArgs = (process.env.YTDLP_EXTRACTOR_ARGS || '').trim();
+  if (extraExtractorArgs) {
+    args.push('--extractor-args', extraExtractorArgs);
+  }
+
   return args;
 }
 
+function extractWarningHint(stderr) {
+  const lines = String(stderr || '')
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter((l) => l.startsWith('WARNING:'));
+  const interesting = lines.find((l) =>
+    /HTTP Error|SSL|EOF|timed out|ProxyError|Unable to download|Sign in|bot|403|429|400|RemoteDisconnected/i.test(l)
+  );
+  if (!interesting) return '';
+  return redactSecrets(interesting.replace(/^WARNING:\s*(\[[^\]]+\]\s*)?/, '')).slice(0, 180);
+}
+
 function formatYtDlpError(stderr, platformKey) {
-  const cleanErr = stderr.split('\n').find((l) => l.includes('ERROR:')) || stderr.trim();
+  const safeStderr = redactSecrets(stderr);
+  const cleanErr = safeStderr.split('\n').find((l) => l.includes('ERROR:')) || safeStderr.trim();
   const msg = cleanErr.replace(/^ERROR:\s*/, '');
+  const lower = msg.toLowerCase();
+
   if (
     platformKey === 'instagram' &&
-    (msg.toLowerCase().includes('cookies') ||
-      msg.toLowerCase().includes('login required') ||
-      msg.toLowerCase().includes('rate-limit'))
+    (lower.includes('cookies') || lower.includes('login required') || lower.includes('rate-limit'))
   ) {
-    return 'Instagram está pidiendo inicio de sesión o limitando peticiones. Añade tu archivo cookies.txt en server/cookies.txt (o YTDLP_COOKIES_BROWSER=chrome en server/.env) para desbloquear Instagram.';
+    return 'Instagram está pidiendo inicio de sesión o limitando peticiones. Configura YTDLP_COOKIES_B64 en las variables de entorno del servidor (o server/cookies.txt en local) para desbloquear Instagram.';
   }
+
+  if (platformKey === 'youtube') {
+    if (lower.includes('sign in to confirm') || lower.includes('not a bot')) {
+      return 'YouTube bloqueó la IP de este servidor en la nube (verificación anti-bot). Configura YTDLP_COOKIES_B64 (cookies exportadas de YouTube) o YTDLP_PROXY en las variables de entorno de tu servidor.';
+    }
+    if (lower.includes('failed to extract any player response')) {
+      const hint = extractWarningHint(safeStderr);
+      const detail = hint ? ` Detalle: ${hint}.` : '';
+      return `YouTube no devolvió respuesta del reproductor.${detail} En servidores Docker (Render/Railway) suele deberse a un bloqueo de IP de YouTube o a un binario antiguo de yt-dlp: redespliega con el Dockerfile actualizado y, si persiste, añade YTDLP_COOKIES_B64 o YTDLP_PROXY en las variables de entorno.`;
+    }
+  }
+
   return msg || 'No se pudo procesar este enlace.';
+}
+
+function execYtDlpSimple(args, timeoutMs = 60000) {
+  return new Promise((resolve) => {
+    const proc = spawn('yt-dlp', args, { windowsHide: true });
+    let stdout = '';
+    let stderr = '';
+    const timer = setTimeout(() => {
+      proc.kill('SIGKILL');
+    }, timeoutMs);
+
+    proc.stdout.on('data', (chunk) => {
+      stdout += chunk.toString();
+    });
+    proc.stderr.on('data', (chunk) => {
+      stderr += chunk.toString();
+    });
+    proc.on('error', (err) => {
+      clearTimeout(timer);
+      resolve({ code: -1, stdout, stderr: err.message });
+    });
+    proc.on('close', (code) => {
+      clearTimeout(timer);
+      resolve({ code, stdout: stdout.trim(), stderr: stderr.trim() });
+    });
+  });
+}
+
+export async function initYtDlp() {
+  const ver = await execYtDlpSimple(['--version'], 15000);
+  if (ver.code === 0 && ver.stdout) {
+    engineStatus.ytdlpVersion = ver.stdout;
+    console.log(`[yt-dlp] versión detectada: ${ver.stdout}`);
+  } else {
+    console.warn(`[yt-dlp] no se pudo detectar la versión: ${ver.stderr || 'error desconocido'}`);
+  }
+
+  if (process.env.YTDLP_AUTO_UPDATE !== 'false') {
+    const upd = await execYtDlpSimple(['-U'], 45000);
+    if (upd.code === 0) {
+      const refreshed = await execYtDlpSimple(['--version'], 15000);
+      if (refreshed.code === 0 && refreshed.stdout) {
+        engineStatus.ytdlpVersion = refreshed.stdout;
+      }
+      console.log(`[yt-dlp] comprobación de actualización completada (${engineStatus.ytdlpVersion || 'desconocida'})`);
+    } else if (upd.stderr || upd.stdout) {
+      console.warn(`[yt-dlp] auto-actualización omitida: ${redactSecrets(upd.stderr || upd.stdout).split('\n')[0]}`);
+    }
+  }
+}
+
+export function getEngineDiagnostics() {
+  return {
+    ytdlpVersion: engineStatus.ytdlpVersion,
+    cookiesConfigured: hasCookiesConfigured(),
+    proxyConfigured: Boolean((process.env.YTDLP_PROXY || '').trim()),
+    playerClient: (process.env.YTDLP_PLAYER_CLIENT || '').trim() || 'default',
+  };
 }
 
 export function detectPlatform(url) {
@@ -72,14 +274,14 @@ function sanitizeFilename(name) {
     .slice(0, 120);
 }
 
-function runYtDlpJson(url, platformKey) {
+function runYtDlpJsonOnce(url, platformKey, { playerClientOverride = '' } = {}) {
   return new Promise((resolve, reject) => {
     const args = [
       '--dump-single-json',
       '--playlist-end',
       '50',
       '--skip-download',
-      ...getCommonYtDlpArgs(),
+      ...getCommonYtDlpArgs(platformKey, { playerClientOverride }),
     ];
 
     // SoundCloud flat-playlist omits titles, durations, and thumbnails;
@@ -101,19 +303,41 @@ function runYtDlpJson(url, platformKey) {
       stderr += chunk.toString();
     });
     proc.on('error', (err) => {
-      reject(new Error(`No se pudo ejecutar yt-dlp: ${err.message}`));
+      reject({ stderr: err.message, spawnError: true });
     });
     proc.on('close', (code) => {
       if (code !== 0) {
-        return reject(new Error(formatYtDlpError(stderr, platformKey)));
+        return reject({ stderr, code });
       }
       try {
         resolve(JSON.parse(stdout));
       } catch {
-        reject(new Error('Respuesta inesperada de yt-dlp al analizar el enlace.'));
+        reject({ stderr: 'Respuesta inesperada de yt-dlp al analizar el enlace.', parseError: true });
       }
     });
   });
+}
+
+async function runYtDlpJson(url, platformKey) {
+  try {
+    return await runYtDlpJsonOnce(url, platformKey);
+  } catch (firstErr) {
+    if (firstErr?.spawnError) {
+      throw new Error(`No se pudo ejecutar yt-dlp: ${firstErr.stderr}`);
+    }
+    if (!firstErr?.parseError && shouldRetryYouTube(firstErr?.stderr, platformKey)) {
+      const fallbackClient = getYouTubeFallbackClient();
+      console.warn(`[yt-dlp] inspect falló con cliente por defecto, reintentando con ${fallbackClient}...`);
+      try {
+        return await runYtDlpJsonOnce(url, platformKey, { playerClientOverride: fallbackClient });
+      } catch (secondErr) {
+        console.error(`[yt-dlp] inspect error (${platformKey}):\n${redactSecrets(secondErr?.stderr || firstErr?.stderr)}`);
+        throw new Error(formatYtDlpError(secondErr?.stderr || firstErr?.stderr, platformKey));
+      }
+    }
+    console.error(`[yt-dlp] inspect error (${platformKey}):\n${redactSecrets(firstErr?.stderr)}`);
+    throw new Error(formatYtDlpError(firstErr?.stderr || '', platformKey));
+  }
 }
 
 export async function inspectUrl(rawUrl) {
@@ -232,41 +456,41 @@ export async function createDownloadJob({ url, searchQuery, mode = 'audio', qual
   const safeBase = title ? sanitizeFilename(title) : '%(title).100s';
   const outputTemplate = path.join(jobDir, `${safeBase}.%(ext)s`);
 
-  const args = [
-    '--newline',
-    '--no-playlist',
-    ...getCommonYtDlpArgs(),
-    '-o',
-    outputTemplate,
-  ];
+  const buildArgs = (playerClientOverride = '') => {
+    const args = [
+      '--newline',
+      '--no-playlist',
+      ...getCommonYtDlpArgs(platformKey, { playerClientOverride }),
+      '-o',
+      outputTemplate,
+    ];
 
-  if (mode === 'audio') {
-    args.push('-x', '--add-metadata');
-    if (quality === 'FLAC') {
-      args.push('--audio-format', 'flac', '--embed-thumbnail');
-    } else if (quality === 'WAV') {
-      args.push('--audio-format', 'wav');
+    if (mode === 'audio') {
+      args.push('-x', '--add-metadata');
+      if (quality === 'FLAC') {
+        args.push('--audio-format', 'flac', '--embed-thumbnail');
+      } else if (quality === 'WAV') {
+        args.push('--audio-format', 'wav');
+      } else {
+        args.push('--audio-format', 'mp3', '--audio-quality', '0', '--embed-thumbnail');
+      }
     } else {
-      args.push('--audio-format', 'mp3', '--audio-quality', '0', '--embed-thumbnail');
+      let formatStr = 'bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best';
+      if (quality === '4K') {
+        formatStr = 'bestvideo[height<=2160][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=2160]+bestaudio/best';
+      } else if (quality === '720p') {
+        formatStr = 'bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=720]+bestaudio/best';
+      }
+      args.push('-f', formatStr, '--merge-output-format', 'mp4', '--add-metadata');
     }
-  } else {
-    let formatStr = 'bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best';
-    if (quality === '4K') {
-      formatStr = 'bestvideo[height<=2160][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=2160]+bestaudio/best';
-    } else if (quality === '720p') {
-      formatStr = 'bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=720]+bestaudio/best';
-    }
-    args.push('-f', formatStr, '--merge-output-format', 'mp4', '--add-metadata');
-  }
 
-  args.push(target);
+    args.push(target);
+    return args;
+  };
 
   job.status = 'downloading';
   job.phase = searchQuery ? 'Buscando audio en alta calidad...' : 'Extrayendo flujo de alta calidad...';
   emitUpdate();
-
-  const proc = spawn('yt-dlp', args, { windowsHide: true });
-  let stderrBuf = '';
 
   const parseLine = (line) => {
     const pctMatch = line.match(/\[download\]\s+(\d+(?:\.\d+)?)%/);
@@ -287,57 +511,82 @@ export async function createDownloadJob({ url, searchQuery, mode = 'audio', qual
     }
   };
 
-  proc.stdout.on('data', (chunk) => {
-    chunk
-      .toString()
-      .split(/\r?\n/)
-      .filter(Boolean)
-      .forEach(parseLine);
-  });
+  const startAttempt = (playerClientOverride = '', isRetry = false) => {
+    const proc = spawn('yt-dlp', buildArgs(playerClientOverride), { windowsHide: true });
+    let stderrBuf = '';
 
-  proc.stderr.on('data', (chunk) => {
-    const text = chunk.toString();
-    stderrBuf += text;
-    text.split(/\r?\n/).filter(Boolean).forEach(parseLine);
-  });
+    proc.stdout.on('data', (chunk) => {
+      chunk
+        .toString()
+        .split(/\r?\n/)
+        .filter(Boolean)
+        .forEach(parseLine);
+    });
 
-  proc.on('error', (err) => {
-    job.status = 'error';
-    job.error = `Error al iniciar yt-dlp: ${err.message}`;
-    emitUpdate();
-  });
+    proc.stderr.on('data', (chunk) => {
+      const text = chunk.toString();
+      stderrBuf += text;
+      text.split(/\r?\n/).filter(Boolean).forEach(parseLine);
+    });
 
-  proc.on('close', async (code) => {
-    if (code !== 0) {
+    proc.on('error', (err) => {
       job.status = 'error';
-      job.error = formatYtDlpError(stderrBuf, platformKey);
+      job.error = `Error al iniciar yt-dlp: ${err.message}`;
       emitUpdate();
-      return;
-    }
+    });
 
-    try {
-      const files = await fs.readdir(jobDir);
-      const validFiles = files.filter((f) => !f.endsWith('.part') && !f.endsWith('.ytdl') && !f.endsWith('.webp') && !f.endsWith('.jpg'));
-      const chosen = validFiles[0] || files[0];
-      if (!chosen) {
-        throw new Error('No se encontró el archivo resultante.');
+    proc.on('close', async (code) => {
+      if (code !== 0) {
+        if (!isRetry && shouldRetryYouTube(stderrBuf, platformKey)) {
+          const fallbackClient = getYouTubeFallbackClient();
+          console.warn(`[yt-dlp] download falló con cliente por defecto, reintentando con ${fallbackClient}...`);
+          try {
+            const leftover = await fs.readdir(jobDir);
+            await Promise.all(leftover.map((f) => fs.rm(path.join(jobDir, f), { force: true })));
+          } catch {
+            // ignore cleanup error
+          }
+          job.progress = 0;
+          job.speed = '';
+          job.phase = 'Reintentando con cliente alternativo de YouTube...';
+          emitUpdate();
+          startAttempt(fallbackClient, true);
+          return;
+        }
+
+        console.error(`[yt-dlp] download error (${platformKey}):\n${redactSecrets(stderrBuf)}`);
+        job.status = 'error';
+        job.error = formatYtDlpError(stderrBuf, platformKey);
+        emitUpdate();
+        return;
       }
-      const fullPath = path.join(jobDir, chosen);
-      const stat = await fs.stat(fullPath);
 
-      job.filePath = fullPath;
-      job.fileName = chosen;
-      job.fileSize = stat.size;
-      job.progress = 100;
-      job.status = 'done';
-      job.phase = 'Listo · Descargando en tu dispositivo';
-      emitUpdate();
-    } catch (err) {
-      job.status = 'error';
-      job.error = err.message;
-      emitUpdate();
-    }
-  });
+      try {
+        const files = await fs.readdir(jobDir);
+        const validFiles = files.filter((f) => !f.endsWith('.part') && !f.endsWith('.ytdl') && !f.endsWith('.webp') && !f.endsWith('.jpg'));
+        const chosen = validFiles[0] || files[0];
+        if (!chosen) {
+          throw new Error('No se encontró el archivo resultante.');
+        }
+        const fullPath = path.join(jobDir, chosen);
+        const stat = await fs.stat(fullPath);
+
+        job.filePath = fullPath;
+        job.fileName = chosen;
+        job.fileSize = stat.size;
+        job.progress = 100;
+        job.status = 'done';
+        job.phase = 'Listo · Descargando en tu dispositivo';
+        emitUpdate();
+      } catch (err) {
+        job.status = 'error';
+        job.error = err.message;
+        emitUpdate();
+      }
+    });
+  };
+
+  startAttempt();
 
   return job;
 }

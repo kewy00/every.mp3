@@ -2,7 +2,7 @@ import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import fs from 'node:fs';
-import { inspectUrl, createDownloadJob, jobs } from './ytdlp.js';
+import { inspectUrl, createDownloadJob, jobs, initYtDlp, getEngineDiagnostics } from './ytdlp.js';
 
 const app = express();
 const PORT = Number(process.env.PORT || 3001);
@@ -19,7 +19,12 @@ app.use(express.json({ limit: '1mb' }));
 
 // Health check
 app.get('/api/health', (_req, res) => {
-  res.json({ ok: true, service: 'every.mp3-engine', timestamp: Date.now() });
+  res.json({
+    ok: true,
+    service: 'every.mp3-engine',
+    timestamp: Date.now(),
+    ...getEngineDiagnostics(),
+  });
 });
 
 // Inspect any URL (YouTube, Spotify, SoundCloud, TikTok, Instagram, etc.)
@@ -132,4 +137,7 @@ app.get('/api/thumbnail', async (req, res) => {
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`every.mp3 engine running on http://localhost:${PORT}`);
+  initYtDlp().catch((err) => {
+    console.warn('[yt-dlp] error en inicialización:', err?.message || err);
+  });
 });
